@@ -1,0 +1,30 @@
+CREATE TABLE IF NOT EXISTS feeds (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL UNIQUE,
+    site_url TEXT NOT NULL DEFAULT '',
+    favicon_id INTEGER NOT NULL DEFAULT 0,
+    is_spark INTEGER NOT NULL DEFAULT 0,
+    last_updated_on_time INTEGER NOT NULL DEFAULT 0,
+    fetch_interval_minutes INTEGER NOT NULL DEFAULT 60,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    favicon_last_checked INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS items (
+    id INTEGER PRIMARY KEY,
+    feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+    title TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT '',
+    html TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    is_saved INTEGER NOT NULL DEFAULT 0,
+    is_read INTEGER NOT NULL DEFAULT 0,
+    created_on_time INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS favicons (
+    id INTEGER PRIMARY KEY,
+    data TEXT NOT NULL,
+    etag TEXT NOT NULL DEFAULT ''
+);
