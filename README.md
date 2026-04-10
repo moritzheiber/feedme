@@ -5,10 +5,12 @@ A Fever API compatible RSS feed aggregator. Single-user, single binary, SQLite-b
 ## Features
 
 - Fever API compatible -- works with any Fever API client (Reeder, Unread, etc.)
-- RSS and Atom feed support
-- Automatic feed fetching with configurable intervals
+- RSS, Atom, and JSON Feed support
+- Automatic feed fetching with configurable intervals and concurrent workers
+- Honors feed-provided TTL, syndication update intervals, skipHours, and skipDays
+- Supports `dc:creator` author fallback and `content:encoded`
 - Exponential backoff for failing feeds
-- Favicon extraction with ETag-based conditional refresh
+- Favicon extraction from feed metadata with HTML scraping fallback and ETag-based conditional refresh
 - OPML import and export
 - CLI for feed management
 
