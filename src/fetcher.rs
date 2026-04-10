@@ -9,9 +9,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FEED_BYTES: usize = 10 * 1024 * 1024;
 const MAX_FAVICON_BYTES: usize = 512 * 1024;
 const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
+const USER_AGENT: &str = concat!("feedme/", env!("CARGO_PKG_VERSION"));
+const FEED_ACCEPT: &str =
+    "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.1";
 
 pub fn build_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -259,7 +263,12 @@ pub async fn fetch_feed(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let resp = client.get(url).send().await?.error_for_status()?;
+    let resp = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, FEED_ACCEPT)
+        .send()
+        .await?
+        .error_for_status()?;
     let body = read_limited(resp, MAX_FEED_BYTES).await?;
     Ok(body)
 }
@@ -420,6 +429,7 @@ pub async fn fetch_favicon_from_html(
 }
 
 const SCHEDULER_TICK: Duration = Duration::from_secs(60);
+const CONCURRENT_FETCHES: usize = 3;
 
 pub async fn check_due_feeds(
     pool: &SqlitePool,
@@ -524,9 +534,18 @@ pub async fn run_scheduler(pool: SqlitePool, client: reqwest::Client, shutdown: 
 
         tracing::info!(count = due.len(), "feeds due for refresh");
 
-        for feed in &due {
-            fetch_one_feed(&client, &pool, feed).await;
+        let mut set = tokio::task::JoinSet::new();
+        for feed in due {
+            if set.len() >= CONCURRENT_FETCHES {
+                set.join_next().await;
+            }
+            let client = client.clone();
+            let pool = pool.clone();
+            set.spawn(async move {
+                fetch_one_feed(&client, &pool, &feed).await;
+            });
         }
+        while set.join_next().await.is_some() {}
     }
 }
 
@@ -1317,6 +1336,18 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    #[test]
+    fn fetch_feed_accept_header_is_set() {
+        assert!(!FEED_ACCEPT.is_empty());
+        assert!(FEED_ACCEPT.contains("application/rss+xml"));
+        assert!(FEED_ACCEPT.contains("application/atom+xml"));
+    }
+
+    #[test]
+    fn user_agent_is_set() {
+        assert!(USER_AGENT.starts_with("feedme/"));
+    }
+
     async fn test_pool() -> SqlitePool {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(include_str!("../migrations/001_initial.sql"))
@@ -1663,5 +1694,11 @@ mod tests {
         cancel.cancel();
         let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(result.is_ok(), "scheduler did not stop within timeout");
+    }
+
+    #[test]
+    fn concurrent_fetches_is_positive() {
+        assert!(CONCURRENT_FETCHES > 0);
+        assert_eq!(CONCURRENT_FETCHES, 3);
     }
 }
