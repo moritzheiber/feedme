@@ -234,6 +234,25 @@ pub async fn update_feed_last_updated(
     Ok(result.rows_affected() > 0)
 }
 
+pub async fn update_feed_schedule(
+    pool: &SqlitePool,
+    id: i64,
+    feed_ttl_minutes: i64,
+    skip_hours_mask: i64,
+    skip_days_mask: i64,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE feeds SET feed_ttl_minutes = ?, skip_hours_mask = ?, skip_days_mask = ? WHERE id = ?",
+    )
+    .bind(feed_ttl_minutes)
+    .bind(skip_hours_mask)
+    .bind(skip_days_mask)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn feed_exists_by_url(pool: &SqlitePool, url: &str) -> Result<bool, sqlx::Error> {
     let row = sqlx::query("SELECT COUNT(*) as count FROM feeds WHERE url = ?")
         .bind(url)

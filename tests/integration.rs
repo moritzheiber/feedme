@@ -59,7 +59,7 @@ async fn full_lifecycle_add_feed_process_items_read_and_mark() {
     </item>
   </channel>
 </rss>"#;
-    let inserted = feedme::fetcher::process_feed(&pool, 1, rss).await.unwrap();
+    let (inserted, _) = feedme::fetcher::process_feed(&pool, 1, rss).await.unwrap();
     assert_eq!(inserted, 2);
 
     let body = format!("api_key={}", api_key);
@@ -283,10 +283,10 @@ async fn process_feed_deduplicates_on_second_run() {
 <item><title>Post</title><link>https://example.com/post</link><description>c</description></item>
 </channel></rss>"#;
 
-    let first = feedme::fetcher::process_feed(&pool, 1, rss).await.unwrap();
+    let (first, _) = feedme::fetcher::process_feed(&pool, 1, rss).await.unwrap();
     assert_eq!(first, 1);
 
-    let second = feedme::fetcher::process_feed(&pool, 1, rss).await.unwrap();
+    let (second, _) = feedme::fetcher::process_feed(&pool, 1, rss).await.unwrap();
     assert_eq!(second, 0);
 }
 

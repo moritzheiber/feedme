@@ -12,6 +12,12 @@ pub struct Feed {
     #[serde(skip)]
     pub fetch_interval_minutes: i64,
     #[serde(skip)]
+    pub feed_ttl_minutes: i64,
+    #[serde(skip)]
+    pub skip_hours_mask: i64,
+    #[serde(skip)]
+    pub skip_days_mask: i64,
+    #[serde(skip)]
     pub consecutive_failures: i64,
     #[serde(skip)]
     pub favicon_last_checked: i64,
@@ -53,6 +59,9 @@ mod tests {
             is_spark: 0,
             last_updated_on_time: 1700000000,
             fetch_interval_minutes: 60,
+            feed_ttl_minutes: 0,
+            skip_hours_mask: 0,
+            skip_days_mask: 0,
             consecutive_failures: 0,
             favicon_last_checked: 0,
         };

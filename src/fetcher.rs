@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use feedparser_rs::{FeedMeta, UpdatePeriod};
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
@@ -17,64 +18,158 @@ pub fn build_client() -> Result<reqwest::Client, reqwest::Error> {
         .build()
 }
 
-pub fn map_entry(entry: &feed_rs::model::Entry) -> (String, String, String, String, i64) {
-    let title = entry
-        .title
-        .as_ref()
-        .map(|t| t.content.clone())
-        .unwrap_or_default();
-    let author = entry
-        .authors
-        .first()
-        .map(|a| a.name.clone())
-        .unwrap_or_default();
-    let html = entry
-        .content
-        .as_ref()
-        .and_then(|c| c.body.clone())
-        .or_else(|| entry.summary.as_ref().map(|s| s.content.clone()))
-        .unwrap_or_default();
-    let url = entry
-        .links
-        .first()
-        .map(|l| l.href.clone())
-        .unwrap_or_default();
-    let created_on_time = entry
-        .published
-        .or(entry.updated)
-        .map(|dt| dt.timestamp())
-        .unwrap_or(0);
-    (title, author, html, url, created_on_time)
+pub struct ProcessResult {
+    pub inserted: usize,
+    pub icon_url: Option<String>,
 }
 
-pub fn extract_site_url(feed: &feed_rs::model::Feed) -> String {
+fn extract_entry_url(entry: &feedparser_rs::Entry) -> String {
+    entry.link.as_deref().unwrap_or_default().to_string()
+}
+
+fn extract_entry_title(entry: &feedparser_rs::Entry) -> String {
+    entry.title.clone().unwrap_or_default()
+}
+
+fn extract_entry_author(entry: &feedparser_rs::Entry, feed: &FeedMeta) -> String {
+    entry
+        .author
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| entry.author_detail.as_ref().and_then(|p| p.name.as_deref()))
+        .or(entry.dc_creator.as_deref())
+        .or(feed.author.as_deref())
+        .or_else(|| feed.author_detail.as_ref().and_then(|p| p.name.as_deref()))
+        .or(feed.dc_creator.as_deref())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn extract_entry_html(entry: &feedparser_rs::Entry) -> String {
+    entry
+        .content
+        .first()
+        .map(|c| c.value.clone())
+        .or_else(|| entry.summary.clone())
+        .unwrap_or_default()
+}
+
+fn extract_entry_timestamp(entry: &feedparser_rs::Entry) -> i64 {
+    entry
+        .published
+        .or(entry.updated)
+        .or(entry.created)
+        .or(entry.dc_date)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
+
+pub fn extract_site_url(feed: &FeedMeta) -> String {
     feed.links
         .iter()
         .find(|l| l.rel.as_deref() == Some("alternate"))
-        .or_else(|| feed.links.first())
-        .map(|l| l.href.clone())
+        .map(|l| l.href.to_string())
+        .or_else(|| feed.link.as_deref().map(String::from))
+        .or_else(|| feed.links.first().map(|l| l.href.to_string()))
         .unwrap_or_default()
 }
 
-pub fn extract_feed_title(feed: &feed_rs::model::Feed) -> String {
-    feed.title
-        .as_ref()
-        .map(|t| t.content.clone())
-        .unwrap_or_default()
+pub fn extract_feed_title(feed: &FeedMeta) -> String {
+    feed.title.clone().unwrap_or_default()
+}
+
+pub fn extract_feed_icon_url(feed: &FeedMeta) -> Option<String> {
+    feed.icon
+        .as_deref()
+        .or(feed.logo.as_deref())
+        .or(feed.image.as_ref().map(|img| img.url.as_str()))
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+pub fn extract_recommended_interval(feed: &FeedMeta) -> i64 {
+    if let Some(ttl) = feed.ttl.as_deref().and_then(|s| s.parse::<i64>().ok())
+        && ttl > 0
+    {
+        return ttl;
+    }
+
+    if let Some(syn) = &feed.syndication {
+        let period_minutes: i64 = match syn.update_period {
+            Some(UpdatePeriod::Hourly) => 60,
+            Some(UpdatePeriod::Daily) => 1440,
+            Some(UpdatePeriod::Weekly) => 10080,
+            Some(UpdatePeriod::Monthly) => 43200,
+            Some(UpdatePeriod::Yearly) => 525600,
+            None => return 0,
+        };
+        let freq = syn
+            .update_frequency
+            .as_deref()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(1)
+            .max(1);
+        return period_minutes / freq;
+    }
+
+    0
+}
+
+pub fn extract_skip_hours_mask(feed: &FeedMeta) -> i64 {
+    let mut mask: i64 = 0;
+    for &hour in &feed.skiphours {
+        if hour < 24 {
+            mask |= 1 << hour;
+        }
+    }
+    mask
+}
+
+pub fn extract_skip_days_mask(feed: &FeedMeta) -> i64 {
+    let mut mask: i64 = 0;
+    for day in &feed.skipdays {
+        let bit = match day.to_lowercase().as_str() {
+            "sunday" => 0,
+            "monday" => 1,
+            "tuesday" => 2,
+            "wednesday" => 3,
+            "thursday" => 4,
+            "friday" => 5,
+            "saturday" => 6,
+            _ => continue,
+        };
+        mask |= 1 << bit;
+    }
+    mask
 }
 
 pub async fn process_feed(
     pool: &SqlitePool,
     feed_id: i64,
     body: &[u8],
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let parsed = feed_rs::parser::parse(body)?;
+) -> Result<(usize, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+    let parsed = feedparser_rs::parse(body)?;
 
-    let title = extract_feed_title(&parsed);
-    let site_url = extract_site_url(&parsed);
+    if parsed.bozo {
+        tracing::warn!(
+            feed_id,
+            bozo_exception = parsed.bozo_exception.as_deref().unwrap_or("unknown"),
+            "feed parsed with errors"
+        );
+    }
+
+    let title = extract_feed_title(&parsed.feed);
+    let site_url = extract_site_url(&parsed.feed);
     if !title.is_empty() || !site_url.is_empty() {
         let _ = crate::db::repo::update_feed_title_and_site(pool, feed_id, &title, &site_url).await;
     }
+
+    let ttl = extract_recommended_interval(&parsed.feed);
+    let skip_hours = extract_skip_hours_mask(&parsed.feed);
+    let skip_days = extract_skip_days_mask(&parsed.feed);
+    let _ = crate::db::repo::update_feed_schedule(pool, feed_id, ttl, skip_hours, skip_days).await;
+
+    let icon_url = extract_feed_icon_url(&parsed.feed);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -84,7 +179,7 @@ pub async fn process_feed(
 
     let mut inserted = 0;
     for entry in &parsed.entries {
-        let (title, author, html, url, created_on_time) = map_entry(entry);
+        let url = extract_entry_url(entry);
         if url.is_empty() {
             continue;
         }
@@ -94,10 +189,14 @@ pub async fn process_feed(
         if exists {
             continue;
         }
+        let entry_title = extract_entry_title(entry);
+        let author = extract_entry_author(entry, &parsed.feed);
+        let html = extract_entry_html(entry);
+        let created_on_time = extract_entry_timestamp(entry);
         if crate::db::repo::insert_item(
             pool,
             feed_id,
-            &title,
+            &entry_title,
             &author,
             &html,
             &url,
@@ -110,20 +209,36 @@ pub async fn process_feed(
         }
     }
 
-    Ok(inserted)
+    Ok((inserted, icon_url))
 }
 
 pub fn is_feed_due(
     last_updated: i64,
     interval_minutes: i64,
+    feed_ttl_minutes: i64,
     consecutive_failures: i64,
+    skip_hours_mask: i64,
+    skip_days_mask: i64,
     now: i64,
 ) -> bool {
     if last_updated == 0 {
         return true;
     }
+
+    if skip_hours_mask != 0 || skip_days_mask != 0 {
+        let utc_hour = (now % 86400) / 3600;
+        if skip_hours_mask & (1 << utc_hour) != 0 {
+            return false;
+        }
+        let utc_day = (now / 86400 + 4) % 7;
+        if skip_days_mask & (1 << utc_day) != 0 {
+            return false;
+        }
+    }
+
+    let base_minutes = interval_minutes.max(feed_ttl_minutes);
     let backoff = 2i64.pow(consecutive_failures.min(6) as u32);
-    let effective_interval = interval_minutes * 60 * backoff;
+    let effective_interval = base_minutes * 60 * backoff;
     let elapsed = now - last_updated;
     elapsed >= effective_interval
 }
@@ -219,19 +334,13 @@ fn resolve_url(href: &str, base_url: &str) -> String {
     format!("{}/{}", base, href)
 }
 
-pub async fn fetch_and_store_favicon(
+pub async fn fetch_favicon_from_url(
     client: &reqwest::Client,
     pool: &SqlitePool,
     feed_id: i64,
-    site_url: &str,
+    favicon_url: &str,
     existing_favicon_id: i64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let html_resp = client.get(site_url).send().await?.error_for_status()?;
-    let html_bytes = read_limited(html_resp, MAX_HTML_BYTES).await?;
-    let html = String::from_utf8_lossy(&html_bytes);
-
-    let favicon_url = extract_favicon_url(&html, site_url).ok_or("no favicon url")?;
-
     let stored_etag = if existing_favicon_id > 0 {
         crate::db::repo::get_favicon(pool, existing_favicon_id)
             .await
@@ -243,18 +352,19 @@ pub async fn fetch_and_store_favicon(
         String::new()
     };
 
-    let mut req = client.get(&favicon_url);
+    let mut req = client.get(favicon_url);
     if !stored_etag.is_empty() {
         req = req.header("If-None-Match", &stored_etag);
     }
 
     let icon_resp = req.send().await?.error_for_status()?;
 
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
     if icon_resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
         let _ = crate::db::repo::update_favicon_last_checked(pool, feed_id, now).await;
         return Ok(());
     }
@@ -277,11 +387,6 @@ pub async fn fetch_and_store_favicon(
     let b64 = base64::engine::general_purpose::STANDARD.encode(&icon_bytes);
     let data = format!("{};base64,{}", content_type, b64);
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
     if existing_favicon_id > 0 {
         let _ = crate::db::repo::update_favicon_data_and_etag(
             pool,
@@ -299,6 +404,21 @@ pub async fn fetch_and_store_favicon(
     Ok(())
 }
 
+pub async fn fetch_favicon_from_html(
+    client: &reqwest::Client,
+    pool: &SqlitePool,
+    feed_id: i64,
+    site_url: &str,
+    existing_favicon_id: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let html_resp = client.get(site_url).send().await?.error_for_status()?;
+    let html_bytes = read_limited(html_resp, MAX_HTML_BYTES).await?;
+    let html = String::from_utf8_lossy(&html_bytes);
+
+    let favicon_url = extract_favicon_url(&html, site_url).ok_or("no favicon url")?;
+    fetch_favicon_from_url(client, pool, feed_id, &favicon_url, existing_favicon_id).await
+}
+
 const SCHEDULER_TICK: Duration = Duration::from_secs(60);
 
 pub async fn check_due_feeds(
@@ -312,7 +432,10 @@ pub async fn check_due_feeds(
             is_feed_due(
                 f.last_updated_on_time,
                 f.fetch_interval_minutes,
+                f.feed_ttl_minutes,
                 f.consecutive_failures,
+                f.skip_hours_mask,
+                f.skip_days_mask,
                 now,
             )
         })
@@ -326,24 +449,24 @@ pub async fn fetch_one_feed(
 ) {
     tracing::info!(feed_id = feed.id, url = %feed.url, "fetching feed");
 
-    let success = match fetch_feed(client, &feed.url).await {
+    let result = match fetch_feed(client, &feed.url).await {
         Ok(body) => match process_feed(pool, feed.id, &body).await {
-            Ok(count) => {
-                tracing::info!(feed_id = feed.id, new_items = count, "feed processed");
-                true
+            Ok(r) => {
+                tracing::info!(feed_id = feed.id, new_items = r.0, "feed processed");
+                Some(r)
             }
             Err(e) => {
                 tracing::warn!(feed_id = feed.id, error = %e, "failed to process feed");
-                false
+                None
             }
         },
         Err(e) => {
             tracing::warn!(feed_id = feed.id, error = %e, "failed to fetch feed");
-            false
+            None
         }
     };
 
-    if success {
+    if result.is_some() {
         let _ = crate::db::repo::reset_failures(pool, feed.id).await;
     } else {
         let _ = crate::db::repo::increment_failures(pool, feed.id).await;
@@ -354,12 +477,20 @@ pub async fn fetch_one_feed(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    if !feed.site_url.is_empty()
-        && should_refresh_favicon(feed.favicon_id, feed.favicon_last_checked, now)
-        && let Err(e) =
-            fetch_and_store_favicon(client, pool, feed.id, &feed.site_url, feed.favicon_id).await
-    {
-        tracing::warn!(feed_id = feed.id, error = %e, "failed to fetch favicon");
+    if should_refresh_favicon(feed.favicon_id, feed.favicon_last_checked, now) {
+        let feed_icon_url = result.as_ref().and_then(|(_, icon)| icon.as_deref());
+
+        let icon_result = if let Some(icon_url) = feed_icon_url {
+            fetch_favicon_from_url(client, pool, feed.id, icon_url, feed.favicon_id).await
+        } else if !feed.site_url.is_empty() {
+            fetch_favicon_from_html(client, pool, feed.id, &feed.site_url, feed.favicon_id).await
+        } else {
+            Ok(())
+        };
+
+        if let Err(e) = icon_result {
+            tracing::warn!(feed_id = feed.id, error = %e, "failed to fetch favicon");
+        }
     }
 }
 
@@ -441,44 +572,359 @@ mod tests {
 </feed>"#
     }
 
-    #[test]
-    fn map_entry_from_rss() {
-        let parsed = feed_rs::parser::parse(sample_rss()).unwrap();
-        let (title, _author, html, url, ts) = map_entry(&parsed.entries[0]);
-        assert_eq!(title, "First Post");
-        assert_eq!(url, "https://example.com/first");
-        assert_eq!(html, "Hello world");
-        assert!(ts > 0);
+    fn sample_rss_with_ttl() -> &'static [u8] {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>TTL Blog</title>
+    <link>https://ttl.example.com</link>
+    <ttl>30</ttl>
+    <item>
+      <title>Post</title>
+      <link>https://ttl.example.com/1</link>
+    </item>
+  </channel>
+</rss>"#
+    }
+
+    fn sample_rss_with_syndication() -> &'static [u8] {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:sy="http://purl.org/rss/1.0/modules/syndication/">
+  <channel>
+    <title>Syndication Blog</title>
+    <link>https://syn.example.com</link>
+    <sy:updatePeriod>daily</sy:updatePeriod>
+    <sy:updateFrequency>2</sy:updateFrequency>
+    <item>
+      <title>Post</title>
+      <link>https://syn.example.com/1</link>
+    </item>
+  </channel>
+</rss>"#
+    }
+
+    fn sample_rss_with_ttl_and_syndication() -> &'static [u8] {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:sy="http://purl.org/rss/1.0/modules/syndication/">
+  <channel>
+    <title>Both Blog</title>
+    <link>https://both.example.com</link>
+    <ttl>45</ttl>
+    <sy:updatePeriod>hourly</sy:updatePeriod>
+    <sy:updateFrequency>1</sy:updateFrequency>
+    <item>
+      <title>Post</title>
+      <link>https://both.example.com/1</link>
+    </item>
+  </channel>
+</rss>"#
+    }
+
+    fn sample_rss_with_skip_hours() -> &'static [u8] {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Skip Hours Blog</title>
+    <link>https://skip.example.com</link>
+    <skipHours>
+      <hour>0</hour>
+      <hour>1</hour>
+      <hour>2</hour>
+      <hour>3</hour>
+    </skipHours>
+    <item>
+      <title>Post</title>
+      <link>https://skip.example.com/1</link>
+    </item>
+  </channel>
+</rss>"#
+    }
+
+    fn sample_rss_with_skip_days() -> &'static [u8] {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Skip Days Blog</title>
+    <link>https://skip.example.com</link>
+    <skipDays>
+      <day>Saturday</day>
+      <day>Sunday</day>
+    </skipDays>
+    <item>
+      <title>Post</title>
+      <link>https://skip.example.com/1</link>
+    </item>
+  </channel>
+</rss>"#
+    }
+
+    fn sample_rss_with_dc_creator() -> &'static [u8] {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>DC Blog</title>
+    <link>https://dc.example.com</link>
+    <item>
+      <title>DC Post</title>
+      <link>https://dc.example.com/1</link>
+      <dc:creator>Dublin Core Author</dc:creator>
+    </item>
+  </channel>
+</rss>"#
+    }
+
+    fn sample_rss_with_image() -> &'static [u8] {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Image Blog</title>
+    <link>https://img.example.com</link>
+    <image>
+      <url>https://img.example.com/logo.png</url>
+      <title>Logo</title>
+      <link>https://img.example.com</link>
+    </image>
+    <item>
+      <title>Post</title>
+      <link>https://img.example.com/1</link>
+    </item>
+  </channel>
+</rss>"#
+    }
+
+    fn sample_atom_with_icon() -> &'static [u8] {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Icon Feed</title>
+  <link href="https://icon.example.com" rel="alternate"/>
+  <icon>https://icon.example.com/favicon.png</icon>
+  <entry>
+    <title>Post</title>
+    <link href="https://icon.example.com/1"/>
+    <id>1</id>
+  </entry>
+</feed>"#
+    }
+
+    fn sample_json_feed() -> &'static [u8] {
+        br#"{
+  "version": "https://jsonfeed.org/version/1.1",
+  "title": "JSON Blog",
+  "home_page_url": "https://json.example.com",
+  "items": [
+    {
+      "id": "1",
+      "title": "JSON Post",
+      "url": "https://json.example.com/1",
+      "content_html": "<p>JSON content</p>",
+      "authors": [{"name": "Charlie"}],
+      "date_published": "2025-01-01T00:00:00Z"
+    }
+  ]
+}"#
+    }
+
+    fn sample_rss_with_content_encoded() -> &'static [u8] {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Content Blog</title>
+    <link>https://content.example.com</link>
+    <item>
+      <title>Rich Post</title>
+      <link>https://content.example.com/1</link>
+      <description>Summary only</description>
+      <content:encoded><![CDATA[<p>Full rich content</p>]]></content:encoded>
+    </item>
+  </channel>
+</rss>"#
     }
 
     #[test]
-    fn map_entry_from_atom() {
-        let parsed = feed_rs::parser::parse(sample_atom()).unwrap();
-        let (title, author, html, url, _ts) = map_entry(&parsed.entries[0]);
-        assert_eq!(title, "Entry One");
-        assert_eq!(author, "Bob");
-        assert!(html.contains("Rich content"));
-        assert_eq!(url, "https://atom.example.com/one");
+    fn entry_extraction_from_rss() {
+        let parsed = feedparser_rs::parse(sample_rss()).unwrap();
+        let e = &parsed.entries[0];
+        assert_eq!(extract_entry_title(e), "First Post");
+        assert_eq!(extract_entry_url(e), "https://example.com/first");
+        assert_eq!(extract_entry_html(e), "Hello world");
+        assert!(extract_entry_timestamp(e) > 0);
+    }
+
+    #[test]
+    fn entry_extraction_from_atom() {
+        let parsed = feedparser_rs::parse(sample_atom()).unwrap();
+        let e = &parsed.entries[0];
+        assert_eq!(extract_entry_title(e), "Entry One");
+        assert_eq!(extract_entry_author(e, &parsed.feed), "Bob");
+        assert!(extract_entry_html(e).contains("Rich content"));
+        assert_eq!(extract_entry_url(e), "https://atom.example.com/one");
+    }
+
+    #[test]
+    fn entry_extraction_from_json_feed() {
+        let parsed = feedparser_rs::parse(sample_json_feed()).unwrap();
+        let e = &parsed.entries[0];
+        assert_eq!(extract_entry_title(e), "JSON Post");
+        assert_eq!(extract_entry_author(e, &parsed.feed), "Charlie");
+        assert!(extract_entry_html(e).contains("JSON content"));
+        assert_eq!(extract_entry_url(e), "https://json.example.com/1");
+        assert!(extract_entry_timestamp(e) > 0);
+    }
+
+    #[test]
+    fn entry_extraction_bare_minimum() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>T</title>
+<item><guid isPermaLink="false">urn:bare</guid></item>
+</channel></rss>"#;
+        let parsed = feedparser_rs::parse(xml as &[u8]).unwrap();
+        assert!(!parsed.entries.is_empty());
+        let e = &parsed.entries[0];
+        assert_eq!(extract_entry_title(e), "");
+        assert_eq!(extract_entry_author(e, &parsed.feed), "");
+        assert_eq!(extract_entry_html(e), "");
+        assert_eq!(extract_entry_timestamp(e), 0);
+    }
+
+    #[test]
+    fn entry_uses_summary_when_no_content() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>T</title><link>https://x.com</link>
+<item><title>T</title><link>https://x.com/1</link><description>Summary only</description></item>
+</channel></rss>"#;
+        let parsed = feedparser_rs::parse(xml as &[u8]).unwrap();
+        assert_eq!(extract_entry_html(&parsed.entries[0]), "Summary only");
+    }
+
+    #[test]
+    fn entry_prefers_content_over_summary() {
+        let parsed = feedparser_rs::parse(sample_rss_with_content_encoded()).unwrap();
+        let html = extract_entry_html(&parsed.entries[0]);
+        assert!(html.contains("Full rich content"));
+        assert!(!html.contains("Summary only"));
+    }
+
+    #[test]
+    fn entry_uses_updated_when_no_published() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>T</title><link href="https://x.com" rel="alternate"/>
+  <entry>
+    <title>T</title><link href="https://x.com/1"/>
+    <updated>2025-06-15T12:00:00Z</updated>
+  </entry>
+</feed>"#;
+        let parsed = feedparser_rs::parse(xml as &[u8]).unwrap();
+        assert!(extract_entry_timestamp(&parsed.entries[0]) > 0);
+    }
+
+    #[test]
+    fn entry_uses_dc_creator_fallback() {
+        let parsed = feedparser_rs::parse(sample_rss_with_dc_creator()).unwrap();
+        assert_eq!(
+            extract_entry_author(&parsed.entries[0], &parsed.feed),
+            "Dublin Core Author"
+        );
     }
 
     #[test]
     fn extract_site_url_from_rss() {
-        let parsed = feed_rs::parser::parse(sample_rss()).unwrap();
-        let site = extract_site_url(&parsed);
-        assert_eq!(site, "https://example.com/");
+        let parsed = feedparser_rs::parse(sample_rss()).unwrap();
+        let site = extract_site_url(&parsed.feed);
+        assert_eq!(site, "https://example.com");
     }
 
     #[test]
     fn extract_site_url_from_atom() {
-        let parsed = feed_rs::parser::parse(sample_atom()).unwrap();
-        let site = extract_site_url(&parsed);
-        assert_eq!(site, "https://atom.example.com/");
+        let parsed = feedparser_rs::parse(sample_atom()).unwrap();
+        let site = extract_site_url(&parsed.feed);
+        assert_eq!(site, "https://atom.example.com");
     }
 
     #[test]
     fn extract_feed_title_from_rss() {
-        let parsed = feed_rs::parser::parse(sample_rss()).unwrap();
-        assert_eq!(extract_feed_title(&parsed), "Example Blog");
+        let parsed = feedparser_rs::parse(sample_rss()).unwrap();
+        assert_eq!(extract_feed_title(&parsed.feed), "Example Blog");
+    }
+
+    #[test]
+    fn extract_recommended_interval_from_ttl() {
+        let parsed = feedparser_rs::parse(sample_rss_with_ttl()).unwrap();
+        assert_eq!(extract_recommended_interval(&parsed.feed), 30);
+    }
+
+    #[test]
+    fn extract_recommended_interval_from_syndication() {
+        let parsed = feedparser_rs::parse(sample_rss_with_syndication()).unwrap();
+        assert_eq!(extract_recommended_interval(&parsed.feed), 720);
+    }
+
+    #[test]
+    fn extract_recommended_interval_ttl_precedence() {
+        let parsed = feedparser_rs::parse(sample_rss_with_ttl_and_syndication()).unwrap();
+        assert_eq!(extract_recommended_interval(&parsed.feed), 45);
+    }
+
+    #[test]
+    fn extract_recommended_interval_no_hints() {
+        let parsed = feedparser_rs::parse(sample_rss()).unwrap();
+        assert_eq!(extract_recommended_interval(&parsed.feed), 0);
+    }
+
+    #[test]
+    fn extract_skip_hours_mask_parses_hours() {
+        let parsed = feedparser_rs::parse(sample_rss_with_skip_hours()).unwrap();
+        let mask = extract_skip_hours_mask(&parsed.feed);
+        assert_eq!(mask, 0b1111);
+        assert_ne!(mask & (1 << 0), 0);
+        assert_ne!(mask & (1 << 1), 0);
+        assert_ne!(mask & (1 << 2), 0);
+        assert_ne!(mask & (1 << 3), 0);
+        assert_eq!(mask & (1 << 4), 0);
+    }
+
+    #[test]
+    fn extract_skip_hours_mask_empty() {
+        let parsed = feedparser_rs::parse(sample_rss()).unwrap();
+        assert_eq!(extract_skip_hours_mask(&parsed.feed), 0);
+    }
+
+    #[test]
+    fn extract_skip_days_mask_parses_days() {
+        let parsed = feedparser_rs::parse(sample_rss_with_skip_days()).unwrap();
+        let mask = extract_skip_days_mask(&parsed.feed);
+        assert_ne!(mask & (1 << 0), 0);
+        assert_ne!(mask & (1 << 6), 0);
+        assert_eq!(mask & (1 << 1), 0);
+    }
+
+    #[test]
+    fn extract_skip_days_mask_empty() {
+        let parsed = feedparser_rs::parse(sample_rss()).unwrap();
+        assert_eq!(extract_skip_days_mask(&parsed.feed), 0);
+    }
+
+    #[test]
+    fn extract_feed_icon_url_from_atom_icon() {
+        let parsed = feedparser_rs::parse(sample_atom_with_icon()).unwrap();
+        let icon = extract_feed_icon_url(&parsed.feed);
+        assert_eq!(
+            icon.as_deref(),
+            Some("https://icon.example.com/favicon.png")
+        );
+    }
+
+    #[test]
+    fn extract_feed_icon_url_none() {
+        let parsed = feedparser_rs::parse(sample_rss()).unwrap();
+        assert!(extract_feed_icon_url(&parsed.feed).is_none());
+    }
+
+    #[test]
+    fn extract_feed_icon_url_from_rss_image() {
+        let parsed = feedparser_rs::parse(sample_rss_with_image()).unwrap();
+        let icon = extract_feed_icon_url(&parsed.feed);
+        assert_eq!(icon.as_deref(), Some("https://img.example.com/logo.png"));
     }
 
     #[tokio::test]
@@ -492,7 +938,7 @@ mod tests {
             .await
             .unwrap();
 
-        let inserted = process_feed(&pool, feed.id, sample_rss()).await.unwrap();
+        let (inserted, _) = process_feed(&pool, feed.id, sample_rss()).await.unwrap();
         assert_eq!(inserted, 2);
 
         let feed = crate::db::repo::get_feed(&pool, feed.id)
@@ -500,7 +946,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(feed.title, "Example Blog");
-        assert_eq!(feed.site_url, "https://example.com/");
+        assert_eq!(feed.site_url, "https://example.com");
         assert!(feed.last_updated_on_time > 0);
     }
 
@@ -515,30 +961,30 @@ mod tests {
             .await
             .unwrap();
 
-        let first = process_feed(&pool, feed.id, sample_rss()).await.unwrap();
+        let (first, _) = process_feed(&pool, feed.id, sample_rss()).await.unwrap();
         assert_eq!(first, 2);
 
-        let second = process_feed(&pool, feed.id, sample_rss()).await.unwrap();
+        let (second, _) = process_feed(&pool, feed.id, sample_rss()).await.unwrap();
         assert_eq!(second, 0);
     }
 
     #[test]
     fn is_feed_due_never_fetched() {
-        assert!(is_feed_due(0, 60, 0, 1000));
+        assert!(is_feed_due(0, 60, 0, 0, 0, 0, 1000));
     }
 
     #[test]
     fn is_feed_due_recently_fetched() {
         let now = 1_700_000_000;
         let last = now - 1800;
-        assert!(!is_feed_due(last, 60, 0, now));
+        assert!(!is_feed_due(last, 60, 0, 0, 0, 0, now));
     }
 
     #[test]
     fn is_feed_due_interval_elapsed() {
         let now = 1_700_000_000;
         let last = now - 3601;
-        assert!(is_feed_due(last, 60, 0, now));
+        assert!(is_feed_due(last, 60, 0, 0, 0, 0, now));
     }
 
     #[test]
@@ -573,7 +1019,7 @@ mod tests {
             .await
             .unwrap();
 
-        let inserted = process_feed(&pool, feed.id, sample_atom()).await.unwrap();
+        let (inserted, _) = process_feed(&pool, feed.id, sample_atom()).await.unwrap();
         assert_eq!(inserted, 1);
 
         let feed = crate::db::repo::get_feed(&pool, feed.id)
@@ -581,7 +1027,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(feed.title, "Atom Feed");
-        assert_eq!(feed.site_url, "https://atom.example.com/");
+        assert_eq!(feed.site_url, "https://atom.example.com");
     }
 
     #[tokio::test]
@@ -596,7 +1042,10 @@ mod tests {
             .unwrap();
 
         let result = process_feed(&pool, feed.id, b"\x00\x01\x02\xff garbage").await;
-        assert!(result.is_err());
+        match result {
+            Err(_) => {}
+            Ok((count, _)) => assert_eq!(count, 0),
+        }
     }
 
     #[tokio::test]
@@ -611,7 +1060,10 @@ mod tests {
             .unwrap();
 
         let result = process_feed(&pool, feed.id, b"").await;
-        assert!(result.is_err());
+        match result {
+            Err(_) => {}
+            Ok((count, _)) => assert_eq!(count, 0),
+        }
     }
 
     #[tokio::test]
@@ -627,7 +1079,10 @@ mod tests {
 
         let html = b"<html><body><h1>Not a feed</h1></body></html>";
         let result = process_feed(&pool, feed.id, html).await;
-        assert!(result.is_err());
+        match result {
+            Err(_) => {}
+            Ok((count, _)) => assert_eq!(count, 0),
+        }
     }
 
     #[tokio::test]
@@ -643,7 +1098,10 @@ mod tests {
 
         let xml = br#"<?xml version="1.0"?><catalog><book>Title</book></catalog>"#;
         let result = process_feed(&pool, feed.id, xml).await;
-        assert!(result.is_err());
+        match result {
+            Err(_) => {}
+            Ok((count, _)) => assert_eq!(count, 0),
+        }
     }
 
     #[tokio::test]
@@ -659,7 +1117,7 @@ mod tests {
 
         let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel><title>Empty</title><link>https://example.com</link></channel></rss>"#;
-        let inserted = process_feed(&pool, feed.id, xml).await.unwrap();
+        let (inserted, _) = process_feed(&pool, feed.id, xml).await.unwrap();
         assert_eq!(inserted, 0);
 
         let updated = crate::db::repo::get_feed(&pool, feed.id)
@@ -686,7 +1144,7 @@ mod tests {
 <item><title>No Link Entry</title><description>Has no link</description></item>
 <item><title>Has Link</title><link>https://example.com/real</link><description>Content</description></item>
 </channel></rss>"#;
-        let inserted = process_feed(&pool, feed.id, xml).await.unwrap();
+        let (inserted, _) = process_feed(&pool, feed.id, xml).await.unwrap();
         assert_eq!(inserted, 1);
     }
 
@@ -705,7 +1163,7 @@ mod tests {
 <rss version="2.0"><channel><title>Blog</title><link>https://example.com</link>
 <item><link>https://example.com/bare</link></item>
 </channel></rss>"#;
-        let inserted = process_feed(&pool, feed.id, xml).await.unwrap();
+        let (inserted, _) = process_feed(&pool, feed.id, xml).await.unwrap();
         assert_eq!(inserted, 1);
 
         let items = crate::db::repo::get_items_since(&pool, 0, 50)
@@ -735,99 +1193,57 @@ mod tests {
 <item><title>No URL</title><description>Skipped</description></item>
 <item><title>Also Good</title><link>https://example.com/also</link><description>Fine</description></item>
 </channel></rss>"#;
-        let inserted = process_feed(&pool, feed.id, xml).await.unwrap();
+        let (inserted, _) = process_feed(&pool, feed.id, xml).await.unwrap();
         assert_eq!(inserted, 2);
-    }
-
-    #[test]
-    fn map_entry_completely_empty() {
-        let entry = feed_rs::model::Entry {
-            id: String::new(),
-            title: None,
-            updated: None,
-            authors: vec![],
-            content: None,
-            links: vec![],
-            summary: None,
-            categories: vec![],
-            contributors: vec![],
-            published: None,
-            source: None,
-            rights: None,
-            media: vec![],
-            language: None,
-            base: None,
-        };
-        let (title, author, html, url, ts) = map_entry(&entry);
-        assert_eq!(title, "");
-        assert_eq!(author, "");
-        assert_eq!(html, "");
-        assert_eq!(url, "");
-        assert_eq!(ts, 0);
-    }
-
-    #[test]
-    fn map_entry_uses_summary_when_no_content() {
-        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0"><channel><title>T</title><link>https://x.com</link>
-<item><title>T</title><link>https://x.com/1</link><description>Summary only</description></item>
-</channel></rss>"#;
-        let parsed = feed_rs::parser::parse(xml as &[u8]).unwrap();
-        let (_title, _author, html, _url, _ts) = map_entry(&parsed.entries[0]);
-        assert_eq!(html, "Summary only");
-    }
-
-    #[test]
-    fn map_entry_prefers_content_over_summary() {
-        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom">
-  <title>T</title><link href="https://x.com" rel="alternate"/>
-  <entry>
-    <title>T</title><link href="https://x.com/1"/>
-    <content type="html">Full content</content>
-    <summary>Just a summary</summary>
-    <published>2025-01-01T00:00:00Z</published>
-  </entry>
-</feed>"#;
-        let parsed = feed_rs::parser::parse(xml as &[u8]).unwrap();
-        let (_title, _author, html, _url, _ts) = map_entry(&parsed.entries[0]);
-        assert_eq!(html, "Full content");
-    }
-
-    #[test]
-    fn map_entry_uses_updated_when_no_published() {
-        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom">
-  <title>T</title><link href="https://x.com" rel="alternate"/>
-  <entry>
-    <title>T</title><link href="https://x.com/1"/>
-    <updated>2025-06-15T12:00:00Z</updated>
-  </entry>
-</feed>"#;
-        let parsed = feed_rs::parser::parse(xml as &[u8]).unwrap();
-        let (_title, _author, _html, _url, ts) = map_entry(&parsed.entries[0]);
-        assert!(ts > 0);
     }
 
     #[test]
     fn is_feed_due_future_last_updated() {
         let now = 1_700_000_000;
         let last = now + 3600;
-        assert!(!is_feed_due(last, 60, 0, now));
+        assert!(!is_feed_due(last, 60, 0, 0, 0, 0, now));
     }
 
     #[test]
     fn is_feed_due_zero_interval() {
         let now = 1_700_000_000;
         let last = now - 1;
-        assert!(is_feed_due(last, 0, 0, now));
+        assert!(is_feed_due(last, 0, 0, 0, 0, 0, now));
     }
 
     #[test]
     fn is_feed_due_exact_boundary() {
         let now = 1_700_000_000;
         let last = now - 3600;
-        assert!(is_feed_due(last, 60, 0, now));
+        assert!(is_feed_due(last, 60, 0, 0, 0, 0, now));
+    }
+
+    #[test]
+    fn is_feed_due_respects_feed_ttl() {
+        let now = 1_700_000_000;
+        let last = now - 1500;
+        assert!(!is_feed_due(last, 15, 30, 0, 0, 0, now));
+    }
+
+    #[test]
+    fn is_feed_due_user_interval_overrides_short_ttl() {
+        let now = 1_700_000_000;
+        let last = now - 1900;
+        assert!(!is_feed_due(last, 60, 15, 0, 0, 0, now));
+    }
+
+    #[test]
+    fn is_feed_due_skip_hours_blocks() {
+        let now = 3 * 3600;
+        let skip_hours_mask = 1i64 << 3;
+        assert!(!is_feed_due(1, 0, 0, 0, skip_hours_mask, 0, now));
+    }
+
+    #[test]
+    fn is_feed_due_skip_days_blocks() {
+        let now = 4 * 86400;
+        let skip_days_mask = 1i64 << 1;
+        assert!(!is_feed_due(1, 0, 0, 0, 0, skip_days_mask, now));
     }
 
     #[test]
@@ -1040,24 +1456,24 @@ mod tests {
     fn is_feed_due_with_backoff_one_failure() {
         let now = 1_700_000_000;
         let last = now - 7200;
-        assert!(is_feed_due(last, 60, 1, now));
+        assert!(is_feed_due(last, 60, 0, 1, 0, 0, now));
     }
 
     #[test]
     fn is_feed_due_with_backoff_delays_retry() {
         let now = 1_700_000_000;
         let last = now - 3700;
-        assert!(!is_feed_due(last, 60, 1, now));
+        assert!(!is_feed_due(last, 60, 0, 1, 0, 0, now));
     }
 
     #[test]
     fn is_feed_due_backoff_capped() {
         let now = 1_700_000_000;
         let last = now - (60 * 64 * 60 + 1);
-        assert!(is_feed_due(last, 60, 10, now));
+        assert!(is_feed_due(last, 60, 0, 10, 0, 0, now));
 
         let last_too_recent = now - (60 * 64 * 60 - 1);
-        assert!(!is_feed_due(last_too_recent, 60, 10, now));
+        assert!(!is_feed_due(last_too_recent, 60, 0, 10, 0, 0, now));
     }
 
     #[test]
@@ -1126,6 +1542,114 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(feed.favicon_last_checked, 1_700_000_000);
+    }
+
+    #[tokio::test]
+    async fn process_feed_stores_ttl() {
+        let pool = test_pool().await;
+        let feed = crate::db::repo::insert_feed(&pool, "https://ttl.example.com/feed", 60)
+            .await
+            .unwrap();
+
+        let (inserted, _) = process_feed(&pool, feed.id, sample_rss_with_ttl())
+            .await
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        let feed = crate::db::repo::get_feed(&pool, feed.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(feed.feed_ttl_minutes, 30);
+    }
+
+    #[tokio::test]
+    async fn process_feed_stores_skip_hours() {
+        let pool = test_pool().await;
+        let feed = crate::db::repo::insert_feed(&pool, "https://skip.example.com/feed", 60)
+            .await
+            .unwrap();
+
+        process_feed(&pool, feed.id, sample_rss_with_skip_hours())
+            .await
+            .unwrap();
+
+        let feed = crate::db::repo::get_feed(&pool, feed.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(feed.skip_hours_mask, 0b1111);
+    }
+
+    #[tokio::test]
+    async fn process_feed_stores_skip_days() {
+        let pool = test_pool().await;
+        let feed = crate::db::repo::insert_feed(&pool, "https://skip.example.com/feed", 60)
+            .await
+            .unwrap();
+
+        process_feed(&pool, feed.id, sample_rss_with_skip_days())
+            .await
+            .unwrap();
+
+        let feed = crate::db::repo::get_feed(&pool, feed.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(feed.skip_days_mask, 0);
+    }
+
+    #[tokio::test]
+    async fn process_feed_json_feed() {
+        let pool = test_pool().await;
+        let feed = crate::db::repo::insert_feed(&pool, "https://json.example.com/feed", 60)
+            .await
+            .unwrap();
+
+        let (inserted, _) = process_feed(&pool, feed.id, sample_json_feed())
+            .await
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        let feed = crate::db::repo::get_feed(&pool, feed.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(feed.title, "JSON Blog");
+    }
+
+    #[tokio::test]
+    async fn process_feed_returns_feed_icon_url() {
+        let pool = test_pool().await;
+        let feed = crate::db::repo::insert_feed(&pool, "https://icon.example.com/feed", 60)
+            .await
+            .unwrap();
+
+        let (_, icon_url) = process_feed(&pool, feed.id, sample_atom_with_icon())
+            .await
+            .unwrap();
+        assert_eq!(
+            icon_url.as_deref(),
+            Some("https://icon.example.com/favicon.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn process_feed_content_encoded() {
+        let pool = test_pool().await;
+        let feed = crate::db::repo::insert_feed(&pool, "https://content.example.com/feed", 60)
+            .await
+            .unwrap();
+
+        let (inserted, _) = process_feed(&pool, feed.id, sample_rss_with_content_encoded())
+            .await
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        let items = crate::db::repo::get_items_since(&pool, 0, 50)
+            .await
+            .unwrap();
+        assert!(items[0].html.contains("Full rich content"));
     }
 
     #[tokio::test]

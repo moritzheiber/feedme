@@ -15,7 +15,7 @@ axum = "0.8.8"
 base64 = "0.22.1"
 clap = { version = "4.6.0", features = ["derive"] }
 dotenvy = "0.15.7"
-feed-rs = "2.3.1"
+feedparser-rs = { version = "0.5.2", default-features = false }
 md5 = "0.8.0"
 opml = "1.1.6"
 reqwest = "0.13.2"

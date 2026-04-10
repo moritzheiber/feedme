@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS feeds (
     is_spark INTEGER NOT NULL DEFAULT 0,
     last_updated_on_time INTEGER NOT NULL DEFAULT 0,
     fetch_interval_minutes INTEGER NOT NULL DEFAULT 60,
+    feed_ttl_minutes INTEGER NOT NULL DEFAULT 0,
+    skip_hours_mask INTEGER NOT NULL DEFAULT 0,
+    skip_days_mask INTEGER NOT NULL DEFAULT 0,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     favicon_last_checked INTEGER NOT NULL DEFAULT 0
 );
