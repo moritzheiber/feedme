@@ -152,6 +152,8 @@ pub async fn process_feed(
     feed_id: i64,
     body: &[u8],
 ) -> Result<(usize, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::debug!(feed_id, body_size = body.len(), "parsing feed body");
+
     let parsed = feedparser_rs::parse(body)?;
 
     if parsed.bozo {
@@ -180,6 +182,12 @@ pub async fn process_feed(
         .unwrap_or_default()
         .as_secs() as i64;
     let _ = crate::db::repo::update_feed_last_updated(pool, feed_id, now).await;
+
+    tracing::debug!(
+        feed_id,
+        entries = parsed.entries.len(),
+        "processing feed entries"
+    );
 
     let mut inserted = 0;
     for entry in &parsed.entries {
@@ -459,6 +467,12 @@ pub async fn fetch_one_feed(
 ) {
     tracing::info!(feed_id = feed.id, url = %feed.url, "fetching feed");
 
+    tracing::debug!(
+        feed_id = feed.id,
+        consecutive_failures = feed.consecutive_failures,
+        "starting feed fetch"
+    );
+
     let result = match fetch_feed(client, &feed.url).await {
         Ok(body) => match process_feed(pool, feed.id, &body).await {
             Ok(r) => {
@@ -529,6 +543,7 @@ pub async fn run_scheduler(pool: SqlitePool, client: reqwest::Client, shutdown: 
         };
 
         if due.is_empty() {
+            tracing::debug!("no feeds due for refresh");
             continue;
         }
 
