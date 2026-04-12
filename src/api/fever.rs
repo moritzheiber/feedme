@@ -28,6 +28,13 @@ pub struct FeverForm {
     pub unread_recently_read: Option<i64>,
 }
 
+pub async fn discovery() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "api_version": 3,
+        "auth": 0,
+    }))
+}
+
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<FeverQuery>,
@@ -619,5 +626,35 @@ mod tests {
 
         assert_eq!(json["auth"], 1);
         assert_eq!(json["unread_item_ids"], format!("{}", item.id));
+    }
+
+    fn get_request(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_discovery_returns_api_version_and_auth_zero() {
+        let state = test_state().await;
+        let app = crate::api::router(state);
+        let req = get_request("/?api");
+        let json = response_json(app, req).await;
+
+        assert_eq!(json["api_version"], 3);
+        assert_eq!(json["auth"], 0);
+    }
+
+    #[tokio::test]
+    async fn get_discovery_with_empty_query() {
+        let state = test_state().await;
+        let app = crate::api::router(state);
+        let req = get_request("/");
+        let json = response_json(app, req).await;
+
+        assert_eq!(json["api_version"], 3);
+        assert_eq!(json["auth"], 0);
     }
 }

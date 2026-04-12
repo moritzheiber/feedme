@@ -19,6 +19,9 @@ impl AppState {
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
-        .route("/", axum::routing::post(fever::handler))
+        .route(
+            "/",
+            axum::routing::get(fever::discovery).post(fever::handler),
+        )
         .with_state(state)
 }
