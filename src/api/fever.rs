@@ -150,6 +150,11 @@ pub async fn handler(
                 let _ = crate::db::repo::mark_feed_read(pool, id, before).await;
                 response["unread_item_ids"] = sync_unread_ids(pool).await;
             }
+            ("group", "read") => {
+                let before = form.before.unwrap_or(0);
+                let _ = crate::db::repo::mark_all_read(pool, before).await;
+                response["unread_item_ids"] = sync_unread_ids(pool).await;
+            }
             _ => {}
         }
     }
@@ -685,5 +690,44 @@ mod tests {
         assert!(groups.is_empty());
         let feeds_groups = json["feeds_groups"].as_array().unwrap();
         assert!(feeds_groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mark_group_as_read() {
+        let state = test_state().await;
+        let feed = crate::db::repo::insert_feed(&state.pool, "https://example.com/feed", 60)
+            .await
+            .unwrap();
+        crate::db::repo::insert_item(
+            &state.pool,
+            feed.id,
+            "Old",
+            "",
+            "",
+            "https://example.com/1",
+            1000,
+        )
+        .await
+        .unwrap();
+        crate::db::repo::insert_item(
+            &state.pool,
+            feed.id,
+            "New",
+            "",
+            "",
+            "https://example.com/2",
+            3000,
+        )
+        .await
+        .unwrap();
+
+        let app = crate::api::router(state);
+        let body = format!("{}&mark=group&as=read&id=0&before=2000", valid_key());
+        let req = post_request("/?api", &body);
+        let json = response_json(app, req).await;
+
+        assert_eq!(json["auth"], 1);
+        let unread = json["unread_item_ids"].as_str().unwrap();
+        assert!(!unread.is_empty());
     }
 }

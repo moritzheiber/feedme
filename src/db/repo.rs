@@ -160,6 +160,14 @@ pub async fn mark_feed_read(
     Ok(result.rows_affected())
 }
 
+pub async fn mark_all_read(pool: &SqlitePool, before: i64) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("UPDATE items SET is_read = 1 WHERE created_on_time <= ?")
+        .bind(before)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn unread_recently_read(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     let result = sqlx::query("UPDATE items SET is_read = 0 WHERE is_read = 1")
         .execute(pool)
@@ -659,6 +667,57 @@ mod tests {
 
         let affected = mark_feed_read(&pool, feed.id, 1500).await.unwrap();
         assert_eq!(affected, 1);
+
+        let unread = get_unread_item_ids(&pool).await.unwrap();
+        assert_eq!(unread.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mark_all_read_before_timestamp() {
+        let pool = test_pool().await;
+        let feed1 = insert_feed(&pool, "https://example.com/feed1.xml", 60)
+            .await
+            .unwrap();
+        let feed2 = insert_feed(&pool, "https://example.com/feed2.xml", 60)
+            .await
+            .unwrap();
+
+        insert_item(
+            &pool,
+            feed1.id,
+            "Old",
+            "",
+            "",
+            "https://example.com/1",
+            1000,
+        )
+        .await
+        .unwrap();
+        insert_item(
+            &pool,
+            feed2.id,
+            "Also old",
+            "",
+            "",
+            "https://example.com/2",
+            1200,
+        )
+        .await
+        .unwrap();
+        insert_item(
+            &pool,
+            feed1.id,
+            "New",
+            "",
+            "",
+            "https://example.com/3",
+            3000,
+        )
+        .await
+        .unwrap();
+
+        let affected = mark_all_read(&pool, 1500).await.unwrap();
+        assert_eq!(affected, 2);
 
         let unread = get_unread_item_ids(&pool).await.unwrap();
         assert_eq!(unread.len(), 1);
