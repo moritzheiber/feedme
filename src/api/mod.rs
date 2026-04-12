@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 
 pub mod auth;
 pub mod fever;
@@ -24,6 +24,11 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/",
             axum::routing::get(fever::discovery).post(fever::handler),
         )
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().include_headers(true))
+                .on_request(DefaultOnRequest::new())
+                .on_response(DefaultOnResponse::new()),
+        )
         .with_state(state)
 }

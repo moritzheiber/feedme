@@ -46,6 +46,7 @@ pub async fn handler(
 
     let authed = super::auth::authenticate(&state, form.api_key.as_deref());
     response["auth"] = serde_json::json!(if authed { 1 } else { 0 });
+    tracing::debug!(authed, "fever auth result");
 
     if !authed {
         return Json(response);
@@ -60,6 +61,7 @@ pub async fn handler(
 
     if query.feeds.is_some() {
         let feeds = crate::db::repo::list_feeds(pool).await.unwrap_or_default();
+        tracing::debug!(feed_count = feeds.len(), "returning feeds");
         response["feeds"] = serde_json::json!(feeds);
         response["feeds_groups"] = serde_json::json!([]);
     }
@@ -72,6 +74,7 @@ pub async fn handler(
     }
 
     if query.items.is_some() {
+        tracing::debug!(since_id = ?query.since_id, max_id = ?query.max_id, with_ids = ?query.with_ids, "items requested");
         let items = if let Some(since_id) = query.since_id {
             crate::db::repo::get_items_since(pool, since_id, 50)
                 .await
@@ -149,6 +152,12 @@ pub async fn handler(
         let _ = crate::db::repo::unread_recently_read(pool).await;
         response["unread_item_ids"] = sync_unread_ids(pool).await;
     }
+
+    let keys: Vec<&str> = response
+        .as_object()
+        .map(|m| m.keys().map(|k| k.as_str()).collect())
+        .unwrap_or_default();
+    tracing::debug!(?keys, "fever response sections");
 
     Json(response)
 }
