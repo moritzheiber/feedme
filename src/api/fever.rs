@@ -8,6 +8,7 @@ use super::AppState;
 #[derive(serde::Deserialize, Default)]
 pub struct FeverQuery {
     pub feeds: Option<String>,
+    pub groups: Option<String>,
     pub favicons: Option<String>,
     pub items: Option<String>,
     pub unread_item_ids: Option<String>,
@@ -63,6 +64,11 @@ pub async fn handler(
         let feeds = crate::db::repo::list_feeds(pool).await.unwrap_or_default();
         tracing::debug!(feed_count = feeds.len(), "returning feeds");
         response["feeds"] = serde_json::json!(feeds);
+        response["feeds_groups"] = serde_json::json!([]);
+    }
+
+    if query.groups.is_some() {
+        response["groups"] = serde_json::json!([]);
         response["feeds_groups"] = serde_json::json!([]);
     }
 
@@ -665,5 +671,19 @@ mod tests {
 
         assert_eq!(json["api_version"], 3);
         assert_eq!(json["auth"], 0);
+    }
+
+    #[tokio::test]
+    async fn groups_endpoint() {
+        let state = test_state().await;
+        let app = crate::api::router(state);
+        let req = post_request("/?api&groups", &valid_key());
+        let json = response_json(app, req).await;
+
+        assert_eq!(json["auth"], 1);
+        let groups = json["groups"].as_array().unwrap();
+        assert!(groups.is_empty());
+        let feeds_groups = json["feeds_groups"].as_array().unwrap();
+        assert!(feeds_groups.is_empty());
     }
 }
