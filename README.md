@@ -82,14 +82,19 @@ Implements the [Fever API](https://web.archive.org/web/20230616124016/https://fe
 
 Authentication: include `api_key` in the POST form data. The key is `md5(email:password)`.
 
+A `GET /` discovery endpoint is available for clients that perform auto-detection (e.g. Unread).
+
 Read endpoints (via query parameters, combinable):
 
 - `?api` -- base authenticated request
 - `?api&feeds` -- list feeds
+- `?api&groups` -- list groups (always empty; groups are not supported)
 - `?api&favicons` -- list favicons
 - `?api&items` -- list items (supports `since_id`, `max_id`, `with_ids`)
 - `?api&unread_item_ids` -- comma-separated unread item IDs
 - `?api&saved_item_ids` -- comma-separated saved item IDs
+
+All feed responses include an empty `feeds_groups` array for client compatibility.
 
 Write endpoints (via POST form data):
 
@@ -97,4 +102,5 @@ Write endpoints (via POST form data):
 - `mark=item&as=saved&id=<ID>` -- save item
 - `mark=item&as=unsaved&id=<ID>` -- unsave item
 - `mark=feed&as=read&id=<ID>&before=<TIMESTAMP>` -- mark feed items read before timestamp
+- `mark=group&as=read&id=<ID>&before=<TIMESTAMP>` -- mark all items read before timestamp (groups are ignored)
 - `unread_recently_read=1` -- mark recently read items as unread
